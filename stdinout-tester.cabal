@@ -1,0 +1,18 @@
+cabal-version:      3.0
+name:               stdinout-tester
+version:            0.1.0.0
+license:            MIT
+license-file:       LICENSE
+author:             Sam Cohen
+maintainer:         samcohen@uchicago.edu
+build-type:         Simple
+
+common warnings
+    ghc-options: -Wall
+
+executable stdinout-tester
+    import:           warnings
+    main-is:          Main.hs
+    build-depends:    base
+    hs-source-dirs:   .
+    default-language: GHC2021
