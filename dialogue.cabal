@@ -1,5 +1,5 @@
 cabal-version:      3.0
-name:               stdinout-tester
+name:               dialogue
 version:            0.1.0.0
 license:            MIT
 license-file:       LICENSE
@@ -8,11 +8,13 @@ maintainer:         samcohen@uchicago.edu
 build-type:         Simple
 
 common warnings
-    ghc-options: -Wall
+    ghc-options: -Wall -Wextra
 
-executable stdinout-tester
+executable dialogue
     import:           warnings
     main-is:          Main.hs
     build-depends:    base
+                    , aeson
+                    , optparse-applicative
     hs-source-dirs:   .
     default-language: GHC2021
