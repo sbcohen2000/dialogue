@@ -17,7 +17,7 @@ import Data.Maybe
 import Data.Text (Text)
 import GHC.Generics
 import Options.Applicative
-import Options.Applicative.Help.Pretty
+import Options.Applicative.Help.Pretty hiding ((</>))
 import System.Directory
 import System.FilePath
 import System.IO
@@ -235,6 +235,16 @@ waitForResponse initialDelay hdl = do
   -- Wait upto 1 second for a response.
   fmap T.pack <$> go0 initialDelay
 
+annotateFirstInputSection :: [Section] -> [(Section, Bool)]
+annotateFirstInputSection [] = []
+annotateFirstInputSection (s@InputSection {}:rest) =
+  (s, True):map (,False) rest
+annotateFirstInputSection (s@OutputSection {}:rest) =
+  (s, False):annotateFirstInputSection rest
+
+annotateLastInputSection :: [Section] -> [(Section, Bool)]
+annotateLastInputSection = reverse . annotateFirstInputSection . reverse
+
 evaluateDialogue :: Options -> Dialogue -> ExceptT Text (WriterT Logs IO) ()
 evaluateDialogue Options {..} Dialogue {..} = do
   let args = words extra_options ++ words (dopts_extra_args opts)
@@ -253,8 +263,8 @@ evaluateDialogue Options {..} Dialogue {..} = do
 
   liftIO $ hSetBuffering writeEnd NoBuffering
 
-  forM_ sections $ \case
-    OutputSection ls -> do
+  forM_ (annotateLastInputSection sections) $ \case
+    (OutputSection ls, _) -> do
       forM_ (zip [(0::Int)..] ls) $ \(n, expected) -> do
         maybeActual <- liftIO $ catch (waitForResponse (dopts_timeout_ms opts) readEnd)
           (\(e :: IOError) -> pure (Just $ T.pack $ show e))
@@ -276,14 +286,15 @@ evaluateDialogue Options {..} Dialogue {..} = do
             , expected <> "\n"
             , "But got:\n"
             , actual ]
-    InputSection ls -> do
+    (InputSection ls, isLast) -> do
       forM_ ls $ \l -> do
         liftIO $ T.hPutStrLn writeEnd l
         logInfo ("Wrote: " <> T.pack (show l))
 
+      when isLast $ liftIO $ hClose writeEnd
+
 evaluateDialogueIntoTest :: Options -> Dialogue -> WriterT Logs IO AutograderTest
 evaluateDialogueIntoTest o d = do
-  liftIO $ print d
   e <- runExceptT $ evaluateDialogue o d
   pure $ case e of
     Left err -> mkTestResult False err
@@ -328,7 +339,7 @@ discoverDialoguesAtPath path = do
             pure [d]
         | isDir = do
             candidates <- filter hasDialogueExt <$> liftIO (listDirectory path)
-            mapM tryToParseDialogue candidates
+            mapM (tryToParseDialogue . (path </>)) candidates
         | otherwise = pure []
 
   catMaybes <$> ds
