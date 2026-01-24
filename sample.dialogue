@@ -1,0 +1,8 @@
+{
+}
+--------
+GHCi, version 9.6.7: https://www.haskell.org/ghc/  :? for help
+ghci> 
+> 2 + 2
+4
+ghci>

@@ -1,36 +1,56 @@
+{-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE RecordWildCards #-}
 
-module Main where
+module Main (main) where
 
+import Control.Exception
+import Control.Monad
 import Control.Monad.Except
-import Data.Aeson (FromJSON, ToJSON, (.:?), (.:?=))
+import Control.Monad.Writer
+import Data.Aeson (FromJSON, ToJSON, (.:?), (.!=))
 import Data.Bifunctor
 import Data.Char
+import Data.Functor
+import Data.List
 import Data.Maybe
 import Data.Text (Text)
 import GHC.Generics
 import Options.Applicative
 import Options.Applicative.Help.Pretty
+import System.Directory
+import System.FilePath
+import System.IO
+import System.Process
 import qualified Data.Aeson as J
 import qualified Data.Aeson.Types as J
 import qualified Data.Text as T
+import qualified Data.Text.IO as T
+
+newtype Autograder
+  = Autograder
+    { tests :: [AutograderTest]
+    }
+  deriving (Generic)
+
+instance ToJSON Autograder
 
 data AutograderTest
   = AutograderTest
     { score     :: !Double
     , max_score :: !Double
-    , name      :: !String
-    , output    :: !String
-    }
+    , name      :: !Text
+    , output    :: !Text
+   }
   deriving (Generic)
 
 instance ToJSON AutograderTest
 
 data DialogueOpts
   = DialogueOpts
-    { dopts_max_score    :: !(Maybe Double)
+    { dopts_max_score    :: !Double
     -- ^ The number of points that this dialogue is worth.
-    , dopts_name         :: !(Maybe String)
+    , dopts_name         :: !Text
     -- ^ The name of this test.
     , dopts_extra_args   :: !String
     -- ^ Extra command-line arguments to append to the command-line
@@ -38,43 +58,35 @@ data DialogueOpts
     , dopts_input_prefix :: !Text
     -- ^ The symbol which should be matched to identify that a line of
     -- the dialogue is part of the input.
+    , dopts_timeout_ms   :: !Int
+    -- ^ The number of milliseconds to wait for the executable to
+    -- deliver a line of output before failing.
     }
-
-defaultDialogueOpts :: DialogueOpts
-defaultDialogueOpts = DialogueOpts
-  { dopts_max_score = Nothing
-  , dopts_name = Nothing
-  , dopts_extra_args = ""
-  , dopts_input_prefix = ">"
-  }
+    deriving (Show)
 
 instance FromJSON DialogueOpts where
   parseJSON (J.Object v) = DialogueOpts
-    <$> v .:?  "max_score"
-    <*> v .:?  "name"
-    <*> v .:?= "extra_args"
-    <*> v .:?= "input_prefix"
+    <$> v .:? "max_score"    .!= 1
+    <*> v .:? "name"         .!= "unnamed test"
+    <*> v .:? "extra_args"   .!= ""
+    <*> v .:? "input_prefix" .!= ">"
+    <*> v .:? "timeout_ms"   .!= 1000
 
   parseJSON invalid =
     J.prependFailure "parsing Coord failed, "
     (J.typeMismatch "Object" invalid)
 
-  omittedField = Just defaultDialogueOpts
+data Section = InputSection  !Lines
+             | OutputSection !Lines
+  deriving (Show)
 
 data Dialogue
   = Dialogue
-    { opts    :: !DialogueOpts
+    { opts     :: !DialogueOpts
     -- ^ Top-level options having to do with this dialogue.
-    , input_sections :: ![Text]
-    -- ^ The input sections, in order.
-    , output_sections :: ![Text]
-    -- ^ The output sections, in order.
+    , sections :: ![Section]
     }
-
-parseDialogueOpts :: Text -> Except Text DialogueOpts
-parseDialogueOpts src = case J.eitherDecodeStrictText src of
-  Left msg -> throwError ("Couldn't parse dialogue options:\n" <> T.pack msg)
-  Right opt -> pure opt
+    deriving (Show)
 
 type Lines = [Text]
 
@@ -92,17 +104,18 @@ spanMaybes :: (a -> Maybe b) -> [a] -> ([b], [a])
 spanMaybes _ [] = ([], [])
 spanMaybes f (a:as) = case f a of
   Just b  -> first (b:) (spanMaybes f as)
-  Nothing -> ([], as)
+  Nothing -> ([], a:as)
 
 -- | Return the longest common prefix of all of the strings.
 longestCommonPrefix :: [Text] -> Text
 longestCommonPrefix [] = ""
 longestCommonPrefix ss@(s:_)
-  | all ((==p) . T.head) ss =
-    T.singleton p <> longestCommonPrefix (map T.init ss)
+  | any T.null ss = ""
+  | all ((==p) . T.take 1) ss =
+    p <> longestCommonPrefix (map (T.drop 1) ss)
   | otherwise = ""
   where
-    p = T.head s
+    p = T.take 1 s
 
 -- | Like `longestCommonPrefix`, except only returns prefixes which
 -- are composed only of whitespace characters.
@@ -141,14 +154,198 @@ parseOutputSection opts ls
 asSeparator :: Text -> Bool
 asSeparator = T.all (=='-') . T.strip
 
-parseDialogue :: DialogueOpts -> Text -> Except Text Dialogue
-parseDialogue opts = undefined
+parseDialoguePrefix :: Lines -> Except Text (DialogueOpts, Lines)
+parseDialoguePrefix ls =
+  let (pfx, rest) = break asSeparator ls
+  in case J.eitherDecodeStrictText (T.unlines pfx) of
+       Left err ->
+         throwError ("Failed to parse dialogue options:\n" <> T.pack err)
+       Right opts -> pure (opts, drop 1 rest)
+
+parseDialogue :: Text -> Except Text Dialogue
+parseDialogue src = do
+  let rest0 = T.lines src
+  (opts, rest1) <- parseDialoguePrefix rest0
+  sections <- case rest1 of
+    []    -> pure []
+    rest2@(l0:_)
+      | isJust (asInputLine opts l0) -> expectInputSection opts rest2
+      | otherwise -> expectOutputSection opts rest2
+  pure Dialogue { opts, sections }
+
+  where expectInputSection opts rest = do
+          (ls, rest') <- parseInputSection opts rest
+          let s = InputSection ls
+          case rest' of
+            [] -> pure [s]
+            rest'' -> (s:) <$> expectOutputSection opts rest''
+
+        expectOutputSection opts rest = do
+          (ls, rest') <- parseOutputSection opts rest
+          let s = OutputSection ls
+          case rest' of
+            [] -> pure [s]
+            rest'' -> (s:) <$> expectInputSection opts rest''
+
+data Log =
+  Log
+  { severity :: !Int
+  , msg      :: !Text
+  }
+
+type Logs = [Log]
+
+decorateWithSeverity :: Int -> Text -> Text
+decorateWithSeverity s t = case s of
+  0 -> "\x1b[31m" <> t <> "\x1b[0m"
+  1 -> "\x1b[33m" <> t <> "\x1b[0m"
+  _ -> t
+
+logWithSeverity :: MonadWriter Logs m => Int -> Text -> m ()
+logWithSeverity severity msg = tell [ Log { severity, msg } ]
+
+logInfo :: MonadWriter Logs m => Text -> m ()
+logInfo = logWithSeverity 2
+
+logWarn :: MonadWriter Logs m => Text -> m ()
+logWarn = logWithSeverity 1
+
+logErr :: MonadWriter Logs m => Text -> m ()
+logErr = logWithSeverity 0
+
+waitForResponse :: Int -> Handle -> IO (Maybe Text)
+waitForResponse initialDelay hdl = do
+  let go0 delay = do
+        rdy <- hWaitForInput hdl delay
+        if rdy
+          -- On recursive calls, wait only 100 milliseconds for the next character.
+          then Just <$> go 100
+          else pure Nothing
+
+      go delay = do
+        rdy <- hWaitForInput hdl delay
+        if rdy
+          then do
+          c <- hGetChar hdl
+          if c == '\n'
+            then pure ""
+            else (c:) <$> go delay
+          else pure ""
+
+  -- Wait upto 1 second for a response.
+  fmap T.pack <$> go0 initialDelay
+
+evaluateDialogue :: Options -> Dialogue -> ExceptT Text (WriterT Logs IO) ()
+evaluateDialogue Options {..} Dialogue {..} = do
+  let args = words extra_options ++ words (dopts_extra_args opts)
+
+  logInfo $ T.pack $ "Running " ++ target ++ " with arguments: " ++ intercalate ", " args
+
+  -- Put stdout and stderr on the same stream
+  (readEnd, w) <- liftIO createPipe
+  liftIO $ hSetBuffering readEnd NoBuffering
+
+  (Just writeEnd, _, _, _) <- liftIO $ createProcess (proc target args)
+                              { cwd = target_cwd
+                              , std_out = UseHandle w
+                              , std_err = UseHandle w
+                              , std_in  = CreatePipe }
+
+  liftIO $ hSetBuffering writeEnd NoBuffering
+
+  forM_ sections $ \case
+    OutputSection ls -> do
+      forM_ (zip [(0::Int)..] ls) $ \(n, expected) -> do
+        maybeActual <- liftIO $ catch (waitForResponse (dopts_timeout_ms opts) readEnd)
+          (\(e :: IOError) -> pure (Just $ T.pack $ show e))
+
+        actual <- case maybeActual of
+          Just l -> pure l
+          Nothing -> throwError
+            $ mconcat [ "The executable took too long (> "
+                      , T.pack (show (dopts_timeout_ms opts))
+                      , " milliseconds) delivering line "
+                      , T.pack (show n) <> " of block:\n"
+                      , T.unlines ls ]
+        logInfo ("Got: " <> T.pack (show actual))
+        when (T.strip expected /= T.strip actual) $ do
+          throwError $ mconcat
+            [ "On line " <> T.pack (show n) <> " of block:\n"
+            , T.unlines ls
+            , "Expected:\n"
+            , expected <> "\n"
+            , "But got:\n"
+            , actual ]
+    InputSection ls -> do
+      forM_ ls $ \l -> do
+        liftIO $ T.hPutStrLn writeEnd l
+        logInfo ("Wrote: " <> T.pack (show l))
+
+evaluateDialogueIntoTest :: Options -> Dialogue -> WriterT Logs IO AutograderTest
+evaluateDialogueIntoTest o d = do
+  liftIO $ print d
+  e <- runExceptT $ evaluateDialogue o d
+  pure $ case e of
+    Left err -> mkTestResult False err
+    Right () -> mkTestResult True "passed"
+  where
+    mkTestResult :: Bool -> Text -> AutograderTest
+    mkTestResult passed output =
+      AutograderTest
+      { name = dopts_name (opts d)
+      , score = if passed then maxScore else 0
+      , output
+      , max_score = maxScore
+      }
+
+    maxScore :: Double
+    maxScore = dopts_max_score (opts d)
+
+hasDialogueExt :: FilePath -> Bool
+hasDialogueExt = (==".dialogue") . takeExtension
+
+tryToParseDialogue :: FilePath -> WriterT Logs IO (Maybe Dialogue)
+tryToParseDialogue path = do
+  logInfo ("Parsing dialogue at " <> T.pack path)
+  src <- liftIO $ T.readFile path
+  let res = runExcept (parseDialogue src)
+  case res of
+    Left err ->
+      logErr ("Could not parse " <> T.pack path <> ":\n" <> err) $> Nothing
+    Right d ->
+      pure (Just d)
+
+discoverDialoguesAtPath :: FilePath -> WriterT Logs IO [Dialogue]
+discoverDialoguesAtPath path = do
+  logInfo ("Searching " <> T.pack path)
+
+  isFile <- liftIO $ doesFileExist path
+  isDir  <- liftIO $ doesDirectoryExist path
+
+  let ds
+        | isFile = do
+            d <- tryToParseDialogue path
+            pure [d]
+        | isDir = do
+            candidates <- filter hasDialogueExt <$> liftIO (listDirectory path)
+            mapM tryToParseDialogue candidates
+        | otherwise = pure []
+
+  catMaybes <$> ds
+
+-- | From a list of search paths, produce a list of @Dialogue@s to
+-- evaluate.
+discoverDialogues :: [FilePath] -> WriterT Logs IO [Dialogue]
+discoverDialogues paths = concat <$> mapM discoverDialoguesAtPath paths
 
 data Options
   = Options
     { target        :: !FilePath
+    , target_cwd    :: !(Maybe FilePath)
     , extra_options :: !String
+    , out_path      :: !(Maybe FilePath)
     , search_paths  :: ![FilePath]
+    , verbosity     :: !Int
     }
 
 optionsParser :: Parser Options
@@ -156,9 +353,18 @@ optionsParser =
   Options
   <$> strArgument ( help "A path which points to the target executable."
                     <> metavar "TARGET" )
-  <*> strOption ( long "extra-arguments"
-                  <> short 'a'
-                  <> help "Extra argument to pass to the target executable." )
+  <*> optional ( strOption ( long "cwd"
+                             <> short 'C'
+                             <> metavar "PATH"
+                             <> help "The working directory to run the TARGET executable." ) )
+  <*> (fromMaybe "" <$> optional
+       ( strOption ( long "extra-arguments"
+                     <> short 'a'
+                     <> help "Extra argument to pass to the target executable." ) ) )
+  <*> optional ( strOption ( long "output"
+                             <> short 'o'
+                             <> metavar "PATH"
+                             <> help "The path to write out the test result JSON." ) )
   <*> many ( strOption ( long "path"
                          <> short 'p'
                          <> help "The path to a directory or file. \
@@ -166,14 +372,34 @@ optionsParser =
                                  \it will be searched for dialogue files. \
                                  \If it points to a file, the file will be \
                                  \interpreted as a test dialogue." ) )
+  <*> option auto ( long "verbosity"
+                    <> short 'v'
+                    <> value 1
+                    <> showDefault
+                    <> help "How verbose to be. The options are 0 (show only errors), \
+                            \1 (show errors and warnings), and 2 (show all messages)" )
 
 pgraph :: String -> Doc
 pgraph = fillSep . map pretty . words
 
 main :: IO ()
 main = do
-  args <- execParser opts
-  undefined
+  o <- execParser opts
+  (results, logs) <- runWriterT $ do
+    ds <- discoverDialogues (search_paths o)
+    when (null ds) $
+      logWarn "No dialogues were discovered!"
+
+    forM ds (evaluateDialogueIntoTest o)
+
+  forM_ logs $ \(Log { msg, severity }) ->
+    when (severity <= verbosity o) $
+      T.putStrLn (decorateWithSeverity severity msg)
+
+  let summary = Autograder results
+
+  let outpath = fromMaybe "results.json" (out_path o)
+  J.encodeFile outpath summary
   where
     opts = info (optionsParser <**> helper)
       ( fullDesc

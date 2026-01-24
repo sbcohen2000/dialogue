@@ -15,8 +15,11 @@ executable dialogue
     main-is:          Main.hs
     build-depends:    base
                     , aeson
-                    , text
+                    , directory
+                    , filepath
                     , mtl
                     , optparse-applicative
+                    , process
+                    , text
     hs-source-dirs:   .
     default-language: GHC2021
