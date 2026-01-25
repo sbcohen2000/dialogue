@@ -21,6 +21,7 @@ import Options.Applicative.Help.Pretty hiding ((</>))
 import System.Directory
 import System.FilePath
 import System.IO
+import System.IO.Error
 import System.Process
 import qualified Data.Aeson as J
 import qualified Data.Aeson.Types as J
@@ -217,24 +218,26 @@ logErr = logWithSeverity 0
 waitForResponse :: Int -> Handle -> IO (Maybe Text)
 waitForResponse initialDelay hdl = do
   let go0 delay = do
-        rdy <- hWaitForInput hdl delay
+        rdy <- catch (hWaitForInput hdl delay) handleIOError
         if rdy
           -- On recursive calls, wait only 100 milliseconds for the next character.
           then Just <$> go 100
           else pure Nothing
 
       go delay = do
-        rdy <- hWaitForInput hdl delay
+        rdy <- catch (hWaitForInput hdl delay) handleIOError
         if rdy
-          then do
-          c <- hGetChar hdl
-          if c == '\n'
-            then pure ""
-            else (c:) <$> go delay
+          then do c <- hGetChar hdl
+                  if c == '\n'
+                    then pure ""
+                    else (c:) <$> go delay
           else pure ""
 
   -- Wait upto 1 second for a response.
   fmap T.pack <$> go0 initialDelay
+  where
+    handleIOError :: IOError -> IO Bool
+    handleIOError e = if isEOFError e then pure False else throwIO e
 
 annotateFirstInputSection :: [Section] -> [(Section, Bool)]
 annotateFirstInputSection [] = []
