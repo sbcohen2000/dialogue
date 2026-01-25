@@ -27,9 +27,12 @@ import qualified Data.Aeson.Types as J
 import qualified Data.Text as T
 import qualified Data.Text.IO as T
 
-newtype Autograder
+data Autograder
   = Autograder
-    { tests :: [AutograderTest]
+    { tests             :: ![AutograderTest]
+    , stdout_visibility :: !String
+    -- ^ Should the stdout captured by the grading program be reported
+    -- to the students?  the options are "hidden" and "visible"
     }
   deriving (Generic)
 
@@ -408,7 +411,8 @@ main = do
     logWarn verbosity "No dialogues were discovered!"
 
   results <- mapM (evaluateDialogueIntoTest o) ds
-  let summary = Autograder results
+  let summary = Autograder { tests = results
+                           , stdout_visibility = "visible" }
 
   let outpath = fromMaybe "results.json" (out_path o)
   J.encodeFile outpath summary
