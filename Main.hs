@@ -7,7 +7,7 @@ module Main (main) where
 import Control.Exception
 import Control.Monad
 import Control.Monad.Except
-import Control.Monad.Writer
+import Control.Monad.IO.Class
 import Data.Aeson (FromJSON, ToJSON, (.:?), (.!=))
 import Data.Bifunctor
 import Data.Char
@@ -135,7 +135,7 @@ removeLeadingWhitespace ls = map (T.drop n) ls
 --
 -- On success, return the stdin section (omitting the prefix), and the
 -- remainder of the input which was not parsed.
-parseInputSection :: DialogueOpts -> Lines -> Except Text (Lines, Lines)
+parseInputSection :: DialogueOpts -> Lines -> Except String (Lines, Lines)
 parseInputSection opts ls
   | null inpt = throwError "Expected input section to have at least one line of input."
   | otherwise = pure (removeLeadingWhitespace inpt, rest)
@@ -144,7 +144,7 @@ parseInputSection opts ls
 
 -- | Parse an output section of the dialogue, which is identified by a
 -- sequence of lines, not starting with the prefix character.
-parseOutputSection :: DialogueOpts -> Lines -> Except Text (Lines, Lines)
+parseOutputSection :: DialogueOpts -> Lines -> Except String (Lines, Lines)
 parseOutputSection opts ls
   | null otpt = throwError "Expected output section to have at least one line of output."
   | otherwise = pure (otpt, rest)
@@ -156,16 +156,16 @@ parseOutputSection opts ls
 asSeparator :: Text -> Bool
 asSeparator = T.all (=='-') . T.strip
 
-parseDialoguePrefix :: Lines -> Except Text (DialogueOpts, Lines)
+parseDialoguePrefix :: Lines -> Except String (DialogueOpts, Lines)
 parseDialoguePrefix ls =
   let (pfx, rest) = break asSeparator ls
   in case J.eitherDecodeStrictText (T.unlines pfx) of
        Left err ->
-         throwError ("Failed to parse dialogue options:\n" <> T.pack err)
+         throwError ("Failed to parse dialogue options:\n" ++ err)
        Right opts -> pure (opts, drop 1 rest)
 
 -- | Parse a dialogue given its @FilePath@, and its @Text@ contents.
-parseDialogue :: FilePath -> Text -> Except Text Dialogue
+parseDialogue :: FilePath -> Text -> Except String Dialogue
 parseDialogue filepath src = do
   let rest0 = T.lines src
   (opts, rest1) <- parseDialoguePrefix rest0
@@ -190,30 +190,25 @@ parseDialogue filepath src = do
             [] -> pure [s]
             rest'' -> (s:) <$> expectInputSection opts rest''
 
-data Log =
-  Log
-  { severity :: !Int
-  , msg      :: !Text
-  }
-
-type Logs = [Log]
-
-decorateWithSeverity :: Int -> Text -> Text
+decorateWithSeverity :: Int -> String -> String
 decorateWithSeverity s t = case s of
-  0 -> "\x1b[31m" <> t <> "\x1b[0m"
-  1 -> "\x1b[33m" <> t <> "\x1b[0m"
+  0 -> "\x1b[31m" ++ t ++ "\x1b[0m"
+  1 -> "\x1b[33m" ++ t ++ "\x1b[0m"
   _ -> t
 
-logWithSeverity :: MonadWriter Logs m => Int -> Text -> m ()
-logWithSeverity severity msg = tell [ Log { severity, msg } ]
+logWithSeverity :: MonadIO m => Int -> Int -> String -> m ()
+logWithSeverity severity verbosity msg
+  | severity <= verbosity =
+    liftIO $ putStrLn (decorateWithSeverity severity msg)
+  | otherwise = pure ()
 
-logInfo :: MonadWriter Logs m => Text -> m ()
+logInfo :: MonadIO m => Int -> String -> m ()
 logInfo = logWithSeverity 2
 
-logWarn :: MonadWriter Logs m => Text -> m ()
+logWarn :: MonadIO  m => Int -> String -> m ()
 logWarn = logWithSeverity 1
 
-logErr :: MonadWriter Logs m => Text -> m ()
+logErr :: MonadIO  m => Int -> String -> m ()
 logErr = logWithSeverity 0
 
 waitForResponse :: Int -> Handle -> IO (Maybe Text)
@@ -248,11 +243,11 @@ annotateFirstInputSection (s@OutputSection {}:rest) =
 annotateLastInputSection :: [Section] -> [(Section, Bool)]
 annotateLastInputSection = reverse . annotateFirstInputSection . reverse
 
-evaluateDialogue :: Options -> Dialogue -> ExceptT Text (WriterT Logs IO) ()
+evaluateDialogue :: Options -> Dialogue -> ExceptT Text IO ()
 evaluateDialogue Options {..} Dialogue {..} = do
   let args = words extra_options ++ words (dopts_extra_args opts)
 
-  logInfo $ T.pack $ "Running " ++ target ++ " with arguments: " ++ intercalate ", " args
+  logInfo verbosity $ "Running " ++ target ++ " with arguments: " ++ intercalate ", " args
 
   -- Put stdout and stderr on the same stream
   (readEnd, w) <- liftIO createPipe
@@ -280,7 +275,7 @@ evaluateDialogue Options {..} Dialogue {..} = do
                       , " milliseconds) delivering line "
                       , T.pack (show n) <> " of block:\n"
                       , T.unlines ls ]
-        logInfo ("Got: " <> T.pack (show actual))
+        logInfo verbosity ("Got: " ++ show actual)
         when (T.strip expected /= T.strip actual) $ do
           throwError $ mconcat
             [ "On line " <> T.pack (show n) <> " of block:\n"
@@ -292,11 +287,11 @@ evaluateDialogue Options {..} Dialogue {..} = do
     (InputSection ls, isLast) -> do
       forM_ ls $ \l -> do
         liftIO $ T.hPutStrLn writeEnd l
-        logInfo ("Wrote: " <> T.pack (show l))
+        logInfo verbosity ("Wrote: " ++ show l)
 
       when isLast $ liftIO $ hClose writeEnd
 
-evaluateDialogueIntoTest :: Options -> Dialogue -> WriterT Logs IO AutograderTest
+evaluateDialogueIntoTest :: Options -> Dialogue -> IO AutograderTest
 evaluateDialogueIntoTest o d = do
   e <- runExceptT $ evaluateDialogue o d
   pure $ case e of
@@ -326,39 +321,39 @@ evaluateDialogueIntoTest o d = do
 hasDialogueExt :: FilePath -> Bool
 hasDialogueExt = (==".dialogue") . takeExtension
 
-parseDialogueFromFile :: FilePath -> WriterT Logs IO (Maybe Dialogue)
-parseDialogueFromFile path = do
-  logInfo ("Parsing dialogue at " <> T.pack path)
+parseDialogueFromFile :: Options -> FilePath -> IO (Maybe Dialogue)
+parseDialogueFromFile Options { verbosity } path = do
+  logInfo verbosity ("Parsing dialogue at " ++ path)
   src <- liftIO $ T.readFile path
   let res = runExcept (parseDialogue path src)
   case res of
     Left err ->
-      logErr ("Could not parse " <> T.pack path <> ":\n" <> err) $> Nothing
+      logErr verbosity ("Could not parse " ++ path ++ ":\n" ++ err) $> Nothing
     Right d ->
       pure (Just d)
 
-discoverDialoguesAtPath :: FilePath -> WriterT Logs IO [Dialogue]
-discoverDialoguesAtPath path = do
-  logInfo ("Searching " <> T.pack path)
+discoverDialoguesAtPath :: Options -> FilePath -> IO [Dialogue]
+discoverDialoguesAtPath o@Options { verbosity } path = do
+  logInfo verbosity ("Searching " ++ path)
 
   isFile <- liftIO $ doesFileExist path
   isDir  <- liftIO $ doesDirectoryExist path
 
   let ds
         | isFile = do
-            d <- parseDialogueFromFile path
+            d <- parseDialogueFromFile o path
             pure [d]
         | isDir = do
             candidates <- filter hasDialogueExt <$> liftIO (listDirectory path)
-            mapM (parseDialogueFromFile . (path </>)) candidates
+            mapM (parseDialogueFromFile o . (path </>)) candidates
         | otherwise = pure []
 
   catMaybes <$> ds
 
 -- | From a list of search paths, produce a list of @Dialogue@s to
 -- evaluate.
-discoverDialogues :: [FilePath] -> WriterT Logs IO [Dialogue]
-discoverDialogues paths = concat <$> mapM discoverDialoguesAtPath paths
+discoverDialogues :: Options -> [FilePath] -> IO [Dialogue]
+discoverDialogues o paths = concat <$> mapM (discoverDialoguesAtPath o) paths
 
 data Options
   = Options
@@ -406,18 +401,13 @@ pgraph = fillSep . map pretty . words
 
 main :: IO ()
 main = do
-  o <- execParser opts
-  (results, logs) <- runWriterT $ do
-    ds <- discoverDialogues (search_paths o)
-    when (null ds) $
-      logWarn "No dialogues were discovered!"
+  o@Options { verbosity } <- execParser opts
+  ds <- discoverDialogues o (search_paths o)
 
-    forM ds (evaluateDialogueIntoTest o)
+  when (null ds) $
+    logWarn verbosity "No dialogues were discovered!"
 
-  forM_ logs $ \(Log { msg, severity }) ->
-    when (severity <= verbosity o) $
-      T.putStrLn (decorateWithSeverity severity msg)
-
+  results <- mapM (evaluateDialogueIntoTest o) ds
   let summary = Autograder results
 
   let outpath = fromMaybe "results.json" (out_path o)
