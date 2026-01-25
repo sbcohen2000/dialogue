@@ -50,7 +50,7 @@ data DialogueOpts
   = DialogueOpts
     { dopts_max_score    :: !Double
     -- ^ The number of points that this dialogue is worth.
-    , dopts_name         :: !Text
+    , dopts_name         :: !(Maybe Text)
     -- ^ The name of this test.
     , dopts_extra_args   :: !String
     -- ^ Extra command-line arguments to append to the command-line
@@ -67,7 +67,7 @@ data DialogueOpts
 instance FromJSON DialogueOpts where
   parseJSON (J.Object v) = DialogueOpts
     <$> v .:? "max_score"    .!= 1
-    <*> v .:? "name"         .!= "unnamed test"
+    <*> v .:? "name"
     <*> v .:? "extra_args"   .!= ""
     <*> v .:? "input_prefix" .!= ">"
     <*> v .:? "timeout_ms"   .!= 1000
@@ -82,7 +82,9 @@ data Section = InputSection  !Lines
 
 data Dialogue
   = Dialogue
-    { opts     :: !DialogueOpts
+    { filepath :: !FilePath
+    -- ^ The filepath where we found this dialogue.
+    , opts     :: !DialogueOpts
     -- ^ Top-level options having to do with this dialogue.
     , sections :: ![Section]
     }
@@ -162,8 +164,9 @@ parseDialoguePrefix ls =
          throwError ("Failed to parse dialogue options:\n" <> T.pack err)
        Right opts -> pure (opts, drop 1 rest)
 
-parseDialogue :: Text -> Except Text Dialogue
-parseDialogue src = do
+-- | Parse a dialogue given its @FilePath@, and its @Text@ contents.
+parseDialogue :: FilePath -> Text -> Except Text Dialogue
+parseDialogue filepath src = do
   let rest0 = T.lines src
   (opts, rest1) <- parseDialoguePrefix rest0
   sections <- case rest1 of
@@ -171,7 +174,7 @@ parseDialogue src = do
     rest2@(l0:_)
       | isJust (asInputLine opts l0) -> expectInputSection opts rest2
       | otherwise -> expectOutputSection opts rest2
-  pure Dialogue { opts, sections }
+  pure Dialogue { opts, filepath, sections }
 
   where expectInputSection opts rest = do
           (ls, rest') <- parseInputSection opts rest
@@ -303,11 +306,19 @@ evaluateDialogueIntoTest o d = do
     mkTestResult :: Bool -> Text -> AutograderTest
     mkTestResult passed output =
       AutograderTest
-      { name = dopts_name (opts d)
+      { name
       , score = if passed then maxScore else 0
       , output
       , max_score = maxScore
       }
+
+    -- | The name of the dialogue. If a name is provided in the
+    -- dialogue options, we use that. Otherwise, we use the basename
+    -- of the dialogue file.
+    name :: Text
+    name = fromMaybe
+      (T.pack $ takeBaseName $ filepath d)
+      (dopts_name (opts d))
 
     maxScore :: Double
     maxScore = dopts_max_score (opts d)
@@ -315,11 +326,11 @@ evaluateDialogueIntoTest o d = do
 hasDialogueExt :: FilePath -> Bool
 hasDialogueExt = (==".dialogue") . takeExtension
 
-tryToParseDialogue :: FilePath -> WriterT Logs IO (Maybe Dialogue)
-tryToParseDialogue path = do
+parseDialogueFromFile :: FilePath -> WriterT Logs IO (Maybe Dialogue)
+parseDialogueFromFile path = do
   logInfo ("Parsing dialogue at " <> T.pack path)
   src <- liftIO $ T.readFile path
-  let res = runExcept (parseDialogue src)
+  let res = runExcept (parseDialogue path src)
   case res of
     Left err ->
       logErr ("Could not parse " <> T.pack path <> ":\n" <> err) $> Nothing
@@ -335,11 +346,11 @@ discoverDialoguesAtPath path = do
 
   let ds
         | isFile = do
-            d <- tryToParseDialogue path
+            d <- parseDialogueFromFile path
             pure [d]
         | isDir = do
             candidates <- filter hasDialogueExt <$> liftIO (listDirectory path)
-            mapM (tryToParseDialogue . (path </>)) candidates
+            mapM (parseDialogueFromFile . (path </>)) candidates
         | otherwise = pure []
 
   catMaybes <$> ds
