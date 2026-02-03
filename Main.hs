@@ -12,6 +12,7 @@ import Data.Aeson (FromJSON, ToJSON, (.:?), (.!=))
 import Data.Bifunctor
 import Data.Char
 import Data.Functor
+import Data.IORef
 import Data.List
 import Data.Maybe
 import Data.Text (Text)
@@ -215,29 +216,43 @@ logWarn = logWithSeverity 1
 logErr :: MonadIO  m => Int -> String -> m ()
 logErr = logWithSeverity 0
 
-waitForResponse :: Int -> Handle -> IO (Maybe Text)
+data Response
+  = Line !Text
+  | Timeout
+  | EOF
+
+waitForResponse :: Int -> Handle -> IO Response
 waitForResponse initialDelay hdl = do
-  let go0 delay = do
-        rdy <- catch (hWaitForInput hdl delay) handleIOError
-        if rdy
-          -- On recursive calls, wait only 100 milliseconds for the next character.
-          then Just <$> go 100
-          else pure Nothing
+  resRef <- newIORef ""
+
+  let respond :: IO Response
+      respond = Line . T.pack . reverse <$> readIORef resRef
+
+  let handleIOError :: IOError -> IO Response
+      handleIOError e
+        | isEOFError e = do
+            res <- readIORef resRef
+            if null res then pure EOF else respond
+        | otherwise = throwIO e
+
+  let go0 delay =
+        catch (do rdy <- hWaitForInput hdl delay
+                  if rdy
+                    -- On recursive calls, wait only 100 milliseconds
+                    -- for the next character.
+                    then go 100 >> respond
+                    else pure Timeout
+              ) handleIOError
 
       go delay = do
-        rdy <- catch (hWaitForInput hdl delay) handleIOError
-        if rdy
-          then do c <- hGetChar hdl
-                  if c == '\n'
-                    then pure ""
-                    else (c:) <$> go delay
-          else pure ""
+        rdy <- hWaitForInput hdl delay
+        when rdy $ do
+          c <- hGetChar hdl
+          if c == '\n'
+            then pure ()
+            else modifyIORef resRef (c:) >> go delay
 
-  -- Wait upto 1 second for a response.
-  fmap T.pack <$> go0 initialDelay
-  where
-    handleIOError :: IOError -> IO Bool
-    handleIOError e = if isEOFError e then pure False else throwIO e
+  go0 initialDelay
 
 annotateFirstInputSection :: [Section] -> [(Section, Bool)]
 annotateFirstInputSection [] = []
@@ -271,25 +286,37 @@ evaluateDialogue Options {..} Dialogue {..} = do
     (OutputSection ls, _) -> do
       forM_ (zip [(0::Int)..] ls) $ \(n, expected) -> do
         maybeActual <- liftIO $ catch (waitForResponse (dopts_timeout_ms opts) readEnd)
-          (\(e :: IOError) -> pure (Just $ T.pack $ show e))
+          (\(e :: IOError) -> pure (Line $ T.pack $ show e))
 
-        actual <- case maybeActual of
-          Just l -> pure l
-          Nothing -> throwError
+        case maybeActual of
+          Line l -> do
+            logInfo verbosity ("Got: " ++ show l)
+
+            when (T.strip expected /= T.strip l) $ do
+              throwError $ mconcat
+                [ "On line " <> T.pack (show n) <> " of block:\n"
+                , T.unlines ls
+                , "Expected:\n"
+                , expected <> "\n"
+                , "But got:\n"
+                , l ]
+
+          Timeout -> throwError
             $ mconcat [ "The executable took too long (> "
                       , T.pack (show (dopts_timeout_ms opts))
                       , " milliseconds) delivering line "
                       , T.pack (show n) <> " of block:\n"
                       , T.unlines ls ]
-        logInfo verbosity ("Got: " ++ show actual)
-        when (T.strip expected /= T.strip actual) $ do
-          throwError $ mconcat
-            [ "On line " <> T.pack (show n) <> " of block:\n"
-            , T.unlines ls
-            , "Expected:\n"
-            , expected <> "\n"
-            , "But got:\n"
-            , actual ]
+
+          EOF | T.null (T.strip expected) -> pure ()
+              | otherwise ->
+                throwError $ mconcat
+                [ "On line " <> T.pack (show n) <> " of block:\n"
+                , T.unlines ls
+                , "Expected:\n"
+                , expected <> "\n"
+                , "But got end of file." ]
+
     (InputSection ls, isLast) -> do
       forM_ ls $ \l -> do
         liftIO $ T.hPutStrLn writeEnd l
